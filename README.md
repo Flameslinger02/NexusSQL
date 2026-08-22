@@ -50,20 +50,31 @@ Click **Test Connection** to verify before saving.
 
 ## AI Assistant (Optional)
 
-The AI assistant uses the Anthropic Claude API.
-To enable it, open `src/app.js` and find this line near the top of `sendAI()`:
+The built-in assistant works with either **Anthropic (Claude)** or **OpenAI (GPT)**.
 
-```js
-'x-api-key': window.ANTHROPIC_API_KEY || '',
-```
+Open the app, click the **gear icon** in the AI panel header, pick a provider and
+paste your API key. That's it — no files to edit.
 
-Set your key by adding this line at the **very top** of `src/app.js`:
+Keys are encrypted at rest with your OS keychain (Windows DPAPI / macOS Keychain)
+and stored in `settings.json` under your user-data folder, well outside this
+repository. They are never written to disk in plain text and never belong in the
+source tree.
 
-```js
-window.ANTHROPIC_API_KEY = 'sk-ant-YOUR_KEY_HERE';
-```
+Get keys at https://console.anthropic.com or https://platform.openai.com
 
-Get a key at https://console.anthropic.com
+The assistant can run read-only queries on its own and propose single-cell or
+single-row edits, which you approve before anything is written. API usage is
+billed by the provider.
+
+## Local MCP Server (Optional)
+
+NexusSQL can expose its databases to an external AI — Claude Code, Claude Desktop,
+a local agent — over MCP. Click **🔌 MCP** in the title bar to configure which
+connections it may use, what it is permitted to do, whether each action needs your
+confirmation, and which tables are off limits.
+
+The server binds to `127.0.0.1` only and requires a bearer token, which the panel
+generates and bakes into a copy-paste connect command.
 
 ## Build an Installer
 

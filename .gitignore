@@ -1,5 +1,37 @@
+# Dependencies and build output
 node_modules/
 dist/
+build/
+out/
+
+# Runtime config — these normally live in the OS user-data folder, but if the
+# app is ever pointed at this directory they must never be committed: they hold
+# encrypted database credentials, API keys and the MCP access token.
+connections.json
+mcp.json
+settings.json
+.env
+.env.*
+
+# Logs and debug output
 *.log
+npm-debug.log*
+yarn-error.log*
+
+# Stray build artifacts
+*.exe
+*.dmg
+*.AppImage
+*.deb
+*.blockmap
+
+# Editor and tooling
+.vscode/
+.idea/
+*.swp
+.claude/settings.local.json
+
+# OS cruft
 .DS_Store
 Thumbs.db
+desktop.ini
