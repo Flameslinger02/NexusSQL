@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; connect-src https://api.anthropic.com https://api.openai.com;">
+<title>NexusSQL</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+
+  <!-- TITLEBAR -->
+  <div class="titlebar">
+    <div class="logo"><div class="logo-dot"></div>NexusSQL</div>
+    <div class="tb-sep"></div>
+    <button class="tb-btn mode-btn active" data-mode="query">Query</button>
+    <button class="tb-btn mode-btn" data-mode="history">History</button>
+    <div class="tb-sep"></div>
+    <button class="tb-btn" id="newConnBtn" onclick="openConnDialog()">+ Connection</button>
+    <button class="tb-btn" id="manageConnBtn" onclick="openConnManager()" title="Manage saved connections">🗂 Saved</button>
+    <button class="tb-btn" id="exportBtn" onclick="exportCSV()">⬇ Export CSV</button>
+    <button class="tb-btn" id="mcpBtn" onclick="openMcpSettings()" title="Let an external AI (Claude Code, local agents) reach this app over MCP">🔌 MCP <span class="mcp-dot" id="mcpDot"></span></button>
+    <div id="connStatus" class="conn-none">No connection</div>
+  </div>
+
+  <div class="app-body">
+
+    <!-- SIDEBAR -->
+    <div class="sidebar" id="sidebar">
+      <div class="sidebar-top">
+        <div class="conn-selector" id="connSelector">
+          <select id="connPicker" onchange="switchConnection(this.value)">
+            <option value="">— no connection —</option>
+          </select>
+          <button class="icon-btn" id="disconnBtn" title="Disconnect (keeps the saved connection)" onclick="disconnectCurrent()">⏏</button>
+          <button class="icon-btn" id="deleteConnBtn" title="Delete saved connection from disk" onclick="deleteSavedConnection()">🗑</button>
+        </div>
+        <input class="search-box" id="filterInput" placeholder="🔍 Filter…" oninput="filterTree(this.value)">
+      </div>
+      <div class="db-tree" id="dbTree">
+        <div class="tree-empty">Connect to a database<br>to browse its schema.</div>
+      </div>
+      <div class="sidebar-footer">
+        <button class="sb-foot-btn" onclick="refreshTree()">↻ Refresh</button>
+        <button class="sb-foot-btn" onclick="openConnDialog()">⚡ New Conn</button>
+      </div>
+    </div>
+
+    <div class="resize-handle-v" id="sidebarResizer"></div>
+
+    <!-- MAIN -->
+    <div class="main">
+
+      <!-- QUERY MODE -->
+      <div id="queryMode" class="mode-panel">
+
+        <!-- DATA VIEW (main area) -->
+        <div class="results-section" id="resultsSection">
+          <div class="results-tabs">
+            <button class="tb-btn editor-toggle" id="editorToggleBtn" onclick="toggleEditor()" title="Show/hide SQL editor (Ctrl+E)">⌨ Query Editor</button>
+            <div class="tb-sep"></div>
+            <div class="res-tab active" id="rtData"     onclick="switchResTab('data',this)">Data</div>
+            <div class="res-tab"        id="rtVars"     onclick="switchResTab('vars',this)">Variables</div>
+            <div class="res-tab"        id="rtMessages" onclick="switchResTab('messages',this)">Messages</div>
+            <div class="res-tab"        id="rtExplain"  onclick="switchResTab('explain',this)">Explain</div>
+            <div class="res-meta">
+              <span id="editBadge" class="edit-badge" style="display:none;"></span>
+              <span id="statusOk">● Ready</span>
+              <span id="rowCount"></span>
+              <span id="queryTime"></span>
+              <button class="tb-btn mini" id="undoBtn" onclick="undoLastEdit()" style="display:none;" title="Undo the last data edit">↶ Undo</button>
+              <button class="tb-btn mini" id="addColBtn" onclick="addColumnDraft()" style="display:none;">➕ Add Column</button>
+              <button class="tb-btn mini" id="addRowBtn" onclick="addDraftRow()" style="display:none;">➕ Add Row</button>
+              <button class="tb-btn mini" onclick="exportCSV()">Export</button>
+            </div>
+          </div>
+          <div class="results-grid" id="resultsGrid">
+            <div class="empty-state">Double-click a table in the sidebar to view its data,<br>or open the <b>⌨ Query Editor</b> to run SQL.</div>
+          </div>
+        </div>
+
+        <!-- EDITOR DRAWER (hidden by default, docks to bottom) -->
+        <div class="editor-resizer" id="editorResizer"><div class="resizer-handle"></div></div>
+        <div class="editor-drawer" id="editorDrawer">
+          <div class="tabs-bar" id="tabsBar">
+            <div class="new-tab-btn" onclick="newTab()" title="Ctrl+T">+</div>
+          </div>
+          <div class="editor-toolbar">
+            <button class="run-btn" id="runBtn" onclick="runQuery()">▶ Run</button>
+            <button class="tb-btn" onclick="formatSQL()">⇌ Format</button>
+            <button class="tb-btn" onclick="explainQuery()">🔍 Explain</button>
+            <div class="tb-sep"></div>
+            <button class="tb-btn" onclick="toggleComment()">// Comment</button>
+            <div style="margin-left:auto;display:flex;align-items:center;gap:8px;">
+              <span class="label-sm">DB</span>
+              <select class="mini-select" id="dbPicker" onchange="selectDatabase(this.value)">
+                <option value="">— select —</option>
+              </select>
+              <span class="label-sm">Limit</span>
+              <select class="mini-select" id="limitSel">
+                <option>1000</option><option>500</option><option>100</option><option>5000</option><option>No limit</option>
+              </select>
+              <button class="tb-btn mini" onclick="toggleEditor(false)" title="Hide editor">✕</button>
+            </div>
+          </div>
+          <div class="editor-wrapper">
+            <div class="line-nums" id="lineNums"></div>
+            <textarea class="code-editor" id="editor" spellcheck="false"
+              oninput="onEditorInput()"
+              onkeydown="handleEditorKey(event)"
+              onclick="updateCursor()" onkeyup="updateCursor()">-- Welcome to NexusSQL
+-- Connect to a MySQL/MariaDB server using the "+ Connection" button
+-- Then select a database and start querying
+
+SELECT 1 + 1 AS result;</textarea>
+          </div>
+        </div>
+      </div>
+
+      <!-- HISTORY MODE -->
+      <div id="historyMode" class="mode-panel" style="display:none;flex-direction:column;">
+        <div class="history-header">Query History <span id="historyCount" style="color:var(--text3);font-weight:400;font-size:12px;"></span></div>
+        <div class="history-list" id="historyList"><div class="empty-state">No history yet.</div></div>
+      </div>
+
+    </div>
+
+    <!-- AI PANEL -->
+    <div class="ai-panel">
+      <div class="ai-header">
+        <span>✨</span><span class="ai-title">AI Assistant</span>
+        <span class="ai-provider-badge" id="aiProviderBadge">Claude</span>
+        <button class="tb-btn mini" style="margin-left:auto;" onclick="openAISettings()" title="AI settings &amp; API key">⚙</button>
+        <button class="tb-btn mini" onclick="clearAI()">Clear</button>
+      </div>
+      <div class="ai-msgs" id="aiMsgs">
+        <div class="msg msg-ai">
+          Hi! I can write, optimize, and explain SQL for MySQL/MariaDB. Try asking:
+          <div class="chip-row">
+            <span class="chip" onclick="quickAsk('Show me the current databases on this server')">List databases</span>
+            <span class="chip" onclick="quickAsk('Write a query to find duplicate rows')">Find duplicates</span>
+            <span class="chip" onclick="quickAsk('Explain what my current query does')">Explain query</span>
+            <span class="chip" onclick="quickAsk('Optimize my current query')">Optimize</span>
+            <span class="chip" onclick="quickAsk('Show me how to create an index')">Create index</span>
+          </div>
+        </div>
+      </div>
+      <div class="ai-input-wrap">
+        <textarea class="ai-input" id="aiInput" placeholder="Ask anything about SQL…" onkeydown="aiKeydown(event)"></textarea>
+        <button class="ai-send" id="aiSend" onclick="sendAI()">➤</button>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- STATUS BAR -->
+  <div class="status-bar">
+    <span class="sb-item">🗄 <span class="val" id="sbServer">—</span></span>
+    <span class="sb-sep">|</span>
+    <span class="sb-item">DB: <span class="val" id="sbDb">—</span></span>
+    <span class="sb-sep">|</span>
+    <span class="sb-item" id="sbVersion">MySQL</span>
+    <span class="sb-sep">|</span>
+    <span class="sb-item val" id="sbPing"></span>
+    <span class="sb-sep">|</span>
+    <span class="sb-item" id="sbCursor">Ln 1, Col 1</span>
+    <div style="margin-left:auto;" class="sb-item"><span id="sbSelection"></span></div>
+  </div>
+
+</div>
+
+<!-- CONNECTION DIALOG -->
+<div class="modal-overlay" id="connModal" style="display:none;">
+  <div class="modal">
+    <div class="modal-header">
+      <span id="connModalTitle">New MySQL / MariaDB Connection</span>
+      <button class="modal-close" onclick="closeConnDialog()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-row"><label>Name</label><input class="form-input" id="ci-name" placeholder="My Server" /></div>
+      <div class="form-row"><label>Host</label><input class="form-input" id="ci-host" value="127.0.0.1" /></div>
+      <div class="form-row"><label>Port</label><input class="form-input" id="ci-port" value="3306" type="number" /></div>
+      <div class="form-row"><label>User</label><input class="form-input" id="ci-user" value="root" /></div>
+      <div class="form-row"><label>Password</label><input class="form-input" id="ci-pass" type="password" placeholder="(leave blank if none)" /></div>
+      <div class="form-row"><label>Database</label><input class="form-input" id="ci-db" placeholder="(optional — leave blank to browse all)" /></div>
+      <div class="form-row"><label></label><label style="display:flex;align-items:center;gap:6px;color:var(--text2);font-size:12px;cursor:pointer;"><input type="checkbox" id="ci-ssl"> Use SSL</label></div>
+      <div id="connTestResult" style="min-height:20px;font-size:12px;padding:4px 0;"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="tb-btn" onclick="testConnection()">Test Connection</button>
+      <button class="tb-btn" onclick="closeConnDialog()">Cancel</button>
+      <button class="run-btn" id="connSaveBtn" onclick="saveConnection()">Connect</button>
+    </div>
+  </div>
+</div>
+
+<!-- SAVED CONNECTIONS MANAGER -->
+<div class="modal-overlay" id="connManagerModal" style="display:none;">
+  <div class="modal modal-wide">
+    <div class="modal-header">
+      Saved Connections
+      <button class="modal-close" onclick="closeConnManager()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="conn-mgr-list" id="connMgrList"></div>
+      <div class="mcp-hint">
+        Saved to <code>connections.json</code> in your user data folder, which survives uninstalling the app.
+        Passwords are encrypted with your OS keychain — never written in plain text.
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="tb-btn" onclick="closeConnManager()">Close</button>
+      <button class="run-btn" onclick="newConnFromManager()">+ New Connection</button>
+    </div>
+  </div>
+</div>
+
+<!-- AI SETTINGS DIALOG -->
+<div class="modal-overlay" id="settingsModal" style="display:none;">
+  <div class="modal">
+    <div class="modal-header">
+      AI Assistant Settings
+      <button class="modal-close" onclick="closeAISettings()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-row"><label>Provider</label>
+        <select class="form-input" id="set-provider">
+          <option value="anthropic">Anthropic (Claude)</option>
+          <option value="openai">OpenAI (GPT)</option>
+        </select>
+      </div>
+      <div class="form-row"><label>Anthropic key</label><input class="form-input" id="set-anthropic-key" type="password" placeholder="sk-ant-..." /></div>
+      <div class="form-row"><label>Claude model</label><input class="form-input" id="set-anthropic-model" placeholder="claude-sonnet-4-6" /></div>
+      <div class="form-row"><label>OpenAI key</label><input class="form-input" id="set-openai-key" type="password" placeholder="sk-..." /></div>
+      <div class="form-row"><label>GPT model</label><input class="form-input" id="set-openai-model" placeholder="gpt-5-mini" /></div>
+      <div class="form-row"><label>Effort</label>
+        <select class="form-input" id="set-effort">
+          <option value="low">Low</option>
+          <option value="medium">Medium (think)</option>
+          <option value="high">High</option>
+        </select>
+      </div>
+      <div style="font-size:11px;color:var(--text3);line-height:1.5;">Keys are stored encrypted via your OS keychain. API usage is billed by the provider — these models have no free API tier. The assistant can run read-only queries on its own and propose single-cell/row edits that you confirm before they run.</div>
+    </div>
+    <div class="modal-footer">
+      <button class="tb-btn" onclick="closeAISettings()">Cancel</button>
+      <button class="run-btn" onclick="saveAISettings()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- MCP SERVER SETTINGS -->
+<div class="modal-overlay" id="mcpModal" style="display:none;">
+  <div class="modal modal-wide">
+    <div class="modal-header">
+      MCP Server — let an external AI use this app
+      <button class="modal-close" onclick="closeMcpSettings()">✕</button>
+    </div>
+    <div class="modal-body mcp-body">
+
+      <!-- server state -->
+      <div class="mcp-status-bar">
+        <span class="mcp-pill" id="mcpPill">Stopped</span>
+        <span class="mcp-url" id="mcpUrl">Not running</span>
+        <span style="margin-left:auto;display:flex;align-items:center;gap:8px;">
+          <span class="label-sm">Port</span>
+          <input class="form-input mcp-port" id="mcp-port" type="number" min="1024" max="65535">
+          <button class="run-btn" id="mcpToggleBtn" onclick="toggleMcpServer()">Start</button>
+        </span>
+      </div>
+      <label class="mcp-check"><input type="checkbox" id="mcp-autostart"> Start automatically when NexusSQL launches</label>
+
+      <!-- connect instructions -->
+      <div class="mcp-section">
+        <div class="mcp-section-title">1 · Connect your AI</div>
+        <div class="mcp-hint">Run this in the folder you use Claude Code from. The server is bound to 127.0.0.1 and needs this token — nothing else on your machine or network can reach your databases without it.</div>
+        <div class="mcp-cmd" id="mcpCmd">—</div>
+        <div class="mcp-btn-row">
+          <button class="tb-btn" onclick="copyMcpCommand()">📋 Copy command</button>
+          <button class="tb-btn" onclick="toggleMcpToken()" id="mcpTokenBtn">👁 Reveal token</button>
+          <button class="tb-btn" onclick="regenMcpToken()">↻ Regenerate token</button>
+        </div>
+      </div>
+
+      <!-- connection scope -->
+      <div class="mcp-section">
+        <div class="mcp-section-title">2 · Which connections can it use</div>
+        <label class="mcp-check"><input type="radio" name="mcpScope" value="all" onchange="onMcpScopeChange()"> Every saved connection</label>
+        <label class="mcp-check"><input type="radio" name="mcpScope" value="selected" onchange="onMcpScopeChange()"> Only the ones I pick</label>
+        <div class="mcp-list" id="mcpProfileList"></div>
+        <div class="mcp-hint">A connection saved with a specific database is automatically confined to that database.</div>
+      </div>
+
+      <!-- permissions -->
+      <div class="mcp-section">
+        <div class="mcp-section-title">3 · What it is allowed to do</div>
+        <label class="mcp-check"><input type="radio" name="mcpLevel" value="read" onchange="onMcpLevelChange()"> <b>Read only</b> <span class="mcp-note">browse schemas and run SELECTs</span></label>
+        <label class="mcp-check"><input type="radio" name="mcpLevel" value="limited" onchange="onMcpLevelChange()"> <b>Limited</b> <span class="mcp-note">read, plus edit / insert / delete one row at a time</span></label>
+        <label class="mcp-check"><input type="radio" name="mcpLevel" value="full" onchange="onMcpLevelChange()"> <b>Full</b> <span class="mcp-note">limited, plus add / change / drop columns</span></label>
+        <label class="mcp-check" id="mcpCompleteRow"><input type="radio" name="mcpLevel" value="complete" onchange="onMcpLevelChange()"> <b class="mcp-danger-text">Complete access</b> <span class="mcp-note">unrestricted — arbitrary SQL, no validation, no undo</span></label>
+        <label class="mcp-check"><input type="radio" name="mcpLevel" value="custom" onchange="onMcpLevelChange()"> <b>Custom</b> <span class="mcp-note">pick tools by hand</span></label>
+        <div id="mcpCustomBox" style="display:none;">
+          <div class="mcp-btn-row" style="margin:6px 0;">
+            <label class="mcp-check"><input type="radio" name="mcpCustomMode" value="whitelist" onchange="renderMcpTools()"> Whitelist (only these)</label>
+            <label class="mcp-check"><input type="radio" name="mcpCustomMode" value="blacklist" onchange="renderMcpTools()"> Blacklist (all except these)</label>
+          </div>
+          <div class="mcp-list" id="mcpToolList"></div>
+        </div>
+      </div>
+
+      <!-- approval -->
+      <div class="mcp-section">
+        <div class="mcp-section-title">4 · Confirmation prompts</div>
+        <label class="mcp-check"><input type="radio" name="mcpApproval" value="always"> Ask me before <b>every</b> action</label>
+        <label class="mcp-check"><input type="radio" name="mcpApproval" value="writes"> Ask me only before actions that <b>change data</b></label>
+        <label class="mcp-check"><input type="radio" name="mcpApproval" value="never"> Never ask — let the AI work unattended</label>
+        <div class="mcp-hint">Unanswered prompts are denied after 60 seconds. Each prompt can also grant a tool for the rest of the session.</div>
+      </div>
+
+      <!-- activity -->
+      <div class="mcp-section">
+        <div class="mcp-section-title">Activity</div>
+        <div class="mcp-log" id="mcpLog"><div class="mcp-hint">Nothing yet.</div></div>
+      </div>
+
+      <!-- danger toggle -->
+      <div class="mcp-danger-zone">
+        <label class="mcp-check">
+          <input type="checkbox" id="mcp-dangerous" onchange="onMcpDangerToggle()">
+          <b class="mcp-danger-text">⚠ Allow Dangerous Settings</b>
+        </label>
+        <div class="mcp-hint">Unlocks <b>Complete access</b>, which gives the AI an <code>execute_sql</code> tool that runs any statement verbatim — including DROP, TRUNCATE and unfiltered UPDATE/DELETE. Nothing is validated, capped, or undoable. Leave this off unless you are pointing the AI at a database you can afford to lose.</div>
+      </div>
+
+    </div>
+    <div class="modal-footer">
+      <button class="tb-btn" onclick="closeMcpSettings()">Close</button>
+      <button class="run-btn" onclick="saveMcpSettings()">Save Settings</button>
+    </div>
+  </div>
+</div>
+
+<!-- MCP APPROVAL PROMPT -->
+<div class="modal-overlay" id="mcpApprovalModal" style="display:none;">
+  <div class="modal">
+    <div class="modal-header">
+      <span id="mcpApprovalTitle">AI wants to make a change</span>
+      <span class="mcp-countdown" id="mcpCountdown"></span>
+    </div>
+    <div class="modal-body">
+      <div class="mcp-approval-meta">
+        <span class="mcp-pill" id="mcpApprovalTier">write</span>
+        <span id="mcpApprovalTool" class="mcp-approval-tool"></span>
+        <span class="mcp-note" id="mcpApprovalConn"></span>
+      </div>
+      <div class="mcp-approval-summary" id="mcpApprovalSummary"></div>
+      <details class="mcp-approval-details">
+        <summary>Raw arguments</summary>
+        <pre id="mcpApprovalArgs"></pre>
+      </details>
+    </div>
+    <div class="modal-footer">
+      <button class="tb-btn mcp-deny" onclick="answerMcpApproval('deny')">Deny</button>
+      <button class="tb-btn" onclick="answerMcpApproval('allow-session')" title="Stop asking about this specific tool until the server restarts">Allow for session</button>
+      <button class="run-btn" onclick="answerMcpApproval('allow')">Allow once</button>
+    </div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+<script src="mcp.js"></script>
+</body>
+</html>
