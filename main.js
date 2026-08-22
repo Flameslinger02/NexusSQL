@@ -5,6 +5,7 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const mysql = require('mysql2/promise');
+const { Types: MYSQL_TYPES } = require('mysql2');
 const { createMcpServer, TOOLS: MCP_TOOLS } = require('./mcp-server');
 
 // Keep dev (`electron .`) and packaged builds on the same userData folder so
@@ -16,6 +17,8 @@ let mainWindow;
 // which survives app uninstall/reinstall — it is NOT inside the app bundle.
 const connectionsFile = () => path.join(app.getPath('userData'), 'connections.json');
 // Use pools instead of single connections — prevents "closed state" errors
+const MCP_READ_TIMEOUT_SEC = 15;    // bound MCP read queries
+const MCP_WRITE_TIMEOUT_SEC = 60;   // execute_sql may legitimately run longer
 const pools = {};
 const poolConfigs = {};
 let connCounter = 0;
@@ -250,6 +253,29 @@ async function getConn(id) {
   return pools[id].getConnection();
 }
 
+
+// Numeric field-type codes → readable names. Reported as column metadata so a
+// client can tell a DECIMAL-as-string from a genuine string. We deliberately do
+// NOT cast those to JS numbers: BIGINT/DECIMAL can exceed 2^53 and would lose
+// precision silently.
+const TYPE_NAME_BY_CODE = (() => {
+  const out = {};
+  for (const [name, code] of Object.entries(MYSQL_TYPES || {})) {
+    if (typeof code === 'number' && out[code] === undefined) out[code] = name;
+  }
+  return out;
+})();
+function typeName(code) { return TYPE_NAME_BY_CODE[code] || String(code); }
+
+// Bound a single statement's runtime. MariaDB and MySQL spell this differently
+// and neither accepts the other's name, so try both and ignore failures — a
+// missing timeout must never block the query itself.
+async function applyStatementTimeout(conn, seconds) {
+  if (!seconds) return;
+  try { await conn.query('SET SESSION max_statement_time = ?', [seconds]); return; } catch (_) {}
+  try { await conn.query('SET SESSION max_execution_time = ?', [Math.round(seconds * 1000)]); } catch (_) {}
+}
+
 function serializeCell(v) {
   if (v === null || v === undefined) return null;
   if (v instanceof Date) return v.toISOString().replace('T', ' ').slice(0, 19);
@@ -348,14 +374,17 @@ async function dbDescribeTable(id, database, table) {
   }
 }
 
-async function dbQuery(id, database, sql) {
+async function dbQuery(id, database, sql, opts) {
   let conn;
+  const o = opts || {};
   try {
     conn = await getConn(id);
     if (database) await conn.query('USE `' + database + '`');
+    await applyStatementTimeout(conn, o.timeoutSec);
 
     const start = Date.now();
-    const [rows, fields] = await conn.query({ sql, rowsAsArray: true });
+    const params = Array.isArray(o.params) ? o.params : undefined;
+    const [rows, fields] = await conn.query({ sql, rowsAsArray: true }, params);
     const elapsed = Date.now() - start;
 
     if (fields && Array.isArray(fields)) {
@@ -366,6 +395,7 @@ async function dbQuery(id, database, sql) {
         orgTable: f.orgTable,
         db: f.db,
         type: f.type,
+        typeName: typeName(f.type),
       }));
       const serialized = rows.map(row => row.map(serializeCell));
       return { ok: true, type: 'select', cols, rows: serialized, elapsed };
@@ -451,6 +481,197 @@ async function dbGetRow(id, database, table, where) {
   } finally {
     if (conn) conn.release();
   }
+}
+
+// ─── SCHEMA INTROSPECTION (read-only, parameterized) ─────────
+// Backs the MCP read tools. Values go through ? placeholders; nothing here
+// interpolates user input into SQL text.
+
+const SYSTEM_SCHEMAS = ['information_schema', 'mysql', 'performance_schema', 'sys'];
+
+// Tables in a database, split into base tables vs views, with the engine and
+// the optimizer's approximate row count (free — it comes from the same row).
+async function dbListTablesRich(id, database) {
+  let conn;
+  try {
+    conn = await getConn(id);
+    const [rows] = await conn.query(
+      'SELECT TABLE_NAME, TABLE_TYPE, TABLE_ROWS, ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME',
+      [database]
+    );
+    const tables = [], views = [];
+    for (const r of rows) {
+      if (String(r.TABLE_TYPE).toUpperCase() === 'VIEW') views.push(r.TABLE_NAME);
+      else tables.push({ name: r.TABLE_NAME, approxRows: r.TABLE_ROWS === null ? null : Number(r.TABLE_ROWS), engine: r.ENGINE });
+    }
+    return { ok: true, tables, views };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  } finally { if (conn) conn.release(); }
+}
+
+// Everything a client needs before writing to a table: columns (same shape the
+// Variables tab uses), comments, indexes, foreign keys, and table meta.
+async function dbTableSchema(id, database, table) {
+  const desc = await dbDescribeTable(id, database, table);
+  if (!desc.ok) return desc;
+
+  let conn;
+  try {
+    conn = await getConn(id);
+
+    const [meta] = await conn.query(
+      'SELECT ENGINE, TABLE_COLLATION, TABLE_ROWS, AUTO_INCREMENT, TABLE_COMMENT FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?',
+      [database, table]
+    );
+    const [comments] = await conn.query(
+      'SELECT COLUMN_NAME, COLUMN_COMMENT FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?',
+      [database, table]
+    );
+    const [idx] = await conn.query(
+      'SELECT INDEX_NAME, NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME, INDEX_TYPE FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY INDEX_NAME, SEQ_IN_INDEX',
+      [database, table]
+    );
+    const [fks] = await conn.query(
+      'SELECT CONSTRAINT_NAME, COLUMN_NAME, REFERENCED_TABLE_SCHEMA, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND REFERENCED_TABLE_NAME IS NOT NULL ORDER BY CONSTRAINT_NAME, ORDINAL_POSITION',
+      [database, table]
+    );
+
+    const commentBy = {};
+    for (const c of comments) if (c.COLUMN_COMMENT) commentBy[c.COLUMN_NAME] = c.COLUMN_COMMENT;
+
+    const indexes = [];
+    for (const r of idx) {
+      let hit = indexes.find(i => i.name === r.INDEX_NAME);
+      if (!hit) { hit = { name: r.INDEX_NAME, unique: Number(r.NON_UNIQUE) === 0, type: r.INDEX_TYPE, columns: [] }; indexes.push(hit); }
+      hit.columns.push(r.COLUMN_NAME);
+    }
+
+    const foreignKeys = [];
+    for (const r of fks) {
+      let hit = foreignKeys.find(f => f.name === r.CONSTRAINT_NAME);
+      if (!hit) {
+        hit = { name: r.CONSTRAINT_NAME, columns: [], references: { database: r.REFERENCED_TABLE_SCHEMA, table: r.REFERENCED_TABLE_NAME, columns: [] } };
+        foreignKeys.push(hit);
+      }
+      hit.columns.push(r.COLUMN_NAME);
+      hit.references.columns.push(r.REFERENCED_COLUMN_NAME);
+    }
+
+    const m = meta[0] || {};
+    return {
+      ok: true,
+      columns: desc.columns.map(c => (commentBy[c.Field] ? { ...c, Comment: commentBy[c.Field] } : c)),
+      indexes,
+      foreignKeys,
+      table: {
+        engine: m.ENGINE || null,
+        collation: m.TABLE_COLLATION || null,
+        approxRows: (m.TABLE_ROWS === null || m.TABLE_ROWS === undefined) ? null : Number(m.TABLE_ROWS),
+        autoIncrement: (m.AUTO_INCREMENT === null || m.AUTO_INCREMENT === undefined) ? null : String(m.AUTO_INCREMENT),
+        comment: m.TABLE_COMMENT || null,
+      },
+    };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  } finally { if (conn) conn.release(); }
+}
+
+// Name search across schemas. `database` scopes it; without one we skip the
+// server's own system schemas so results stay about the user's data.
+async function dbFindTables(id, pattern, database, limit) {
+  let conn;
+  try {
+    conn = await getConn(id);
+    const cap = Math.min(Math.max(parseInt(limit) || 100, 1), 500);
+    let sql = 'SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE, TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_NAME LIKE ?';
+    const params = [pattern];
+    if (database) { sql += ' AND TABLE_SCHEMA = ?'; params.push(database); }
+    else { sql += ' AND TABLE_SCHEMA NOT IN (?)'; params.push(SYSTEM_SCHEMAS); }
+    sql += ' ORDER BY TABLE_SCHEMA, TABLE_NAME LIMIT ' + cap;
+    const [rows] = await conn.query(sql, params);
+    return {
+      ok: true,
+      matches: rows.map(r => ({
+        database: r.TABLE_SCHEMA,
+        table: r.TABLE_NAME,
+        isView: String(r.TABLE_TYPE).toUpperCase() === 'VIEW',
+        approxRows: r.TABLE_ROWS === null ? null : Number(r.TABLE_ROWS),
+      })),
+    };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  } finally { if (conn) conn.release(); }
+}
+
+async function dbFindColumns(id, pattern, database, limit) {
+  let conn;
+  try {
+    conn = await getConn(id);
+    const cap = Math.min(Math.max(parseInt(limit) || 100, 1), 500);
+    let sql = 'SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, COLUMN_KEY FROM information_schema.COLUMNS WHERE COLUMN_NAME LIKE ?';
+    const params = [pattern];
+    if (database) { sql += ' AND TABLE_SCHEMA = ?'; params.push(database); }
+    else { sql += ' AND TABLE_SCHEMA NOT IN (?)'; params.push(SYSTEM_SCHEMAS); }
+    sql += ' ORDER BY TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME LIMIT ' + cap;
+    const [rows] = await conn.query(sql, params);
+    return {
+      ok: true,
+      matches: rows.map(r => ({
+        database: r.TABLE_SCHEMA, table: r.TABLE_NAME, column: r.COLUMN_NAME,
+        type: r.COLUMN_TYPE, key: r.COLUMN_KEY || null,
+      })),
+    };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  } finally { if (conn) conn.release(); }
+}
+
+async function dbServerDetail(id) {
+  let conn;
+  try {
+    conn = await getConn(id);
+    const [[r]] = await conn.query(
+      'SELECT VERSION() AS version, @@character_set_server AS charset, @@collation_server AS collation, ' +
+      '@@time_zone AS timeZone, @@system_time_zone AS systemTimeZone, NOW() AS serverTime, ' +
+      '@@sql_mode AS sqlMode, DATABASE() AS currentDatabase'
+    );
+    const version = String(r.version || '');
+    return {
+      ok: true,
+      info: {
+        version,
+        flavor: /mariadb/i.test(version) ? 'MariaDB' : 'MySQL',
+        charset: r.charset, collation: r.collation,
+        timeZone: r.timeZone, systemTimeZone: r.systemTimeZone,
+        serverTime: serializeCell(r.serverTime),
+        sqlMode: r.sqlMode, currentDatabase: r.currentDatabase,
+      },
+    };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  } finally { if (conn) conn.release(); }
+}
+
+// First N rows of a table — the usual first move after describing one.
+async function dbSampleRows(id, database, table, n) {
+  let conn;
+  try {
+    conn = await getConn(id);
+    const cap = Math.min(Math.max(parseInt(n) || 10, 1), 100);
+    await applyStatementTimeout(conn, MCP_READ_TIMEOUT_SEC);
+    const [rows, fields] = await conn.query(
+      { sql: 'SELECT * FROM ??.?? LIMIT ' + cap, rowsAsArray: true },
+      [database, table]
+    );
+    return {
+      ok: true,
+      columns: (fields || []).map(f => ({ name: f.name, typeName: typeName(f.type) })),
+      rows: rows.map(row => row.map(serializeCell)),
+    };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  } finally { if (conn) conn.release(); }
 }
 
 // ─── ROW EDITING (parameterized — identifiers via ??, values via ?) ──
@@ -738,6 +959,8 @@ async function dropMcpPools() {
 
 const mcpServer = createMcpServer({
   appVersion: app.getVersion(),
+  readTimeoutSec: MCP_READ_TIMEOUT_SEC,
+  writeTimeoutSec: MCP_WRITE_TIMEOUT_SEC,
   getConfig: () => mcpConfig,
   getProfiles: () => loadProfilesFromDisk(),
   requestApproval,
@@ -746,7 +969,13 @@ const mcpServer = createMcpServer({
     poolForProfile,
     listDatabases: dbListDatabases,
     listTables: dbListTables,
+    listTablesRich: dbListTablesRich,
     describeTable: dbDescribeTable,
+    tableSchema: dbTableSchema,
+    findTables: dbFindTables,
+    findColumns: dbFindColumns,
+    serverDetail: dbServerDetail,
+    sampleRows: dbSampleRows,
     query: dbQuery,
     tableCount: dbTableCount,
     updateCell: dbUpdateCell,

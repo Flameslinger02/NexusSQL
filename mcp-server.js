@@ -25,9 +25,28 @@ const DEFAULT_ROW_LIMIT = 200;
 const MAX_ROW_LIMIT = 1000;
 
 // ─── READ-ONLY SQL VALIDATION ────────────────────────────────
-// Used by the `run_select` tool. Comments and string literals are stripped
-// first so a keyword can't be smuggled inside them, then we require an
-// allow-listed leading keyword AND the absence of any mutating keyword.
+// Used by the `run_select` tool.
+//
+// Order matters: comments, string literals AND backtick-quoted identifiers are
+// blanked first, so a keyword can only be seen where it could actually execute.
+// Then the leading keyword must be allow-listed, and no mutating keyword may
+// appear anywhere.
+//
+// Deliberately ALLOWED:
+//   SELECT 'insert into x'            keyword inside a string literal
+//   SELECT id AS `update` FROM t      keyword as a quoted identifier
+//   -- drop table x                   keyword inside a comment
+//   SHOW CREATE TABLE t               SHOW cannot mutate, so the deny-list is
+//                                     skipped for it (this is the only skip)
+//   WITH c AS (SELECT 1) SELECT * FROM c
+//
+// Deliberately BLOCKED:
+//   SELECT 1; DROP TABLE t            statement chaining
+//   EXPLAIN ANALYZE DELETE FROM t     EXPLAIN ANALYZE really executes the DML
+//                                     on MySQL 8.0.18+/MariaDB, so EXPLAIN is
+//                                     still fully scanned
+//   SELECT * FROM t INTO OUTFILE ...  writes files
+//   CREATE TABLE / UPDATE / DELETE / GRANT / SET / CALL / LOAD ...
 function isReadOnlySQL(sql) {
   if (!sql || typeof sql !== 'string') return false;
   const stripped = sql
@@ -36,15 +55,52 @@ function isReadOnlySQL(sql) {
     .replace(/#[^\n]*/g, ' ')
     .replace(/'(?:[^'\\]|\\.|'')*'/g, "''")
     .replace(/"(?:[^"\\]|\\.|"")*"/g, '""')
+    .replace(/`(?:[^`]|``)*`/g, '``')      // quoted identifiers are not keywords
     .trim()
     .replace(/;+\s*$/, '');
   if (!stripped) return false;
   if (/;/.test(stripped)) return false;                       // no statement chaining
+
   const first = (stripped.replace(/^[(\s]+/, '').split(/\s+/)[0] || '').toUpperCase();
   if (!['SELECT', 'SHOW', 'DESCRIBE', 'DESC', 'EXPLAIN', 'WITH'].includes(first)) return false;
+
+  // Every SHOW variant is read-only, including SHOW CREATE TABLE — whose
+  // CREATE would otherwise trip the deny-list below.
+  if (first === 'SHOW') return true;
+
   if (/\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|REPLACE|GRANT|REVOKE|RENAME|CALL|LOAD|HANDLER|LOCK|UNLOCK|SET|PREPARE|EXECUTE|BEGIN|COMMIT|ROLLBACK)\b/i.test(stripped)) return false;
   if (/\bINTO\s+(OUTFILE|DUMPFILE)\b/i.test(stripped)) return false;
   return true;
+}
+
+// ─── ARGUMENT VALIDATION ─────────────────────────────────────
+// Coercing a missing argument sends the model chasing a table literally named
+// "undefined". Fail loudly with the parameter name instead.
+function requireArgs(tool, args, profile) {
+  const required = (tool.inputSchema && tool.inputSchema.required) || [];
+  for (const key of required) {
+    // A connection pinned to one database supplies it implicitly, so demanding
+    // it back from the caller would be wrong.
+    if (key === 'database' && profile && profile.database) continue;
+    const v = args[key];
+    if (v === undefined || v === null || (typeof v === 'string' && v.trim() === '')) {
+      throw new RpcError(-32602, `Missing required parameter: ${key} (tool "${tool.name}")`);
+    }
+  }
+}
+
+// Integer arg with explicit bounds. Rejects rather than coerces, because a
+// silently-substituted limit is indistinguishable from one that was honoured.
+function intArg(value, name, min, max, fallback) {
+  if (value === undefined || value === null) return fallback;
+  const n = typeof value === 'number' ? value : Number(String(value).trim());
+  if (!Number.isInteger(n)) {
+    throw new RpcError(-32602, `${name} must be an integer, got ${JSON.stringify(value)}`);
+  }
+  if (n < min || n > max) {
+    throw new RpcError(-32602, `${name} must be between ${min} and ${max}, got ${n}`);
+  }
+  return n;
 }
 
 // ─── TOOL REGISTRY ───────────────────────────────────────────
@@ -72,16 +128,23 @@ const TOOLS = [
   },
   {
     name: 'list_tables', tier: 'read',
-    description: 'List the tables and views inside one database.',
+    description: 'List the tables and views in one database. Returns names only by default. Pass detail:"full" for approxRows and engine per table — approxRows is the optimizer estimate (free, exact for small InnoDB tables, approximate for large ones), so prefer it over count_rows when a ballpark will do.',
     inputSchema: {
       type: 'object',
-      properties: { ...CONN_ARG, database: { type: 'string', description: 'Database name.' } },
+      properties: {
+        ...CONN_ARG,
+        database: { type: 'string', description: 'Database name.' },
+        detail: {
+          type: 'string', enum: ['names', 'full'],
+          description: "'names' (default) returns just table and view names — cheapest. 'full' adds approxRows and engine per table, which roughly triples the response size; ask for it only when you actually need sizes.",
+        },
+      },
       required: ['database'],
     },
   },
   {
     name: 'describe_table', tier: 'read',
-    description: 'Show a table\'s columns: name, type, nullability, key, default and extra (e.g. auto_increment). Use this before writing to a table so you know its primary key.',
+    description: 'Full schema for one table: columns (name, type, nullability, key, default, extra, comment), indexes, foreign keys, and table meta (engine, collation, approxRows, current AUTO_INCREMENT). Call this before writing to a table so you know its primary key.',
     inputSchema: {
       type: 'object',
       properties: { ...CONN_ARG, database: { type: 'string' }, table: { type: 'string' } },
@@ -99,17 +162,64 @@ const TOOLS = [
   },
   {
     name: 'run_select', tier: 'read',
-    description: 'Run one read-only SQL statement (SELECT / SHOW / DESCRIBE / EXPLAIN / WITH) and return the rows. Anything that writes is rejected — use the dedicated write tools instead. Results are capped; narrow your query rather than raising the cap.',
+    description: 'Run one read-only statement (SELECT / SHOW / DESCRIBE / EXPLAIN / WITH) and return rows. SHOW CREATE TABLE works. Writes are rejected — use the dedicated write tools. Rows come back as arrays matching `columns` order, with `totalRows` giving the full match count so you can tell whether `truncated` matters. Prefer `params` over pasting literals into the SQL.',
     inputSchema: {
       type: 'object',
       properties: {
         ...CONN_ARG,
         database: { type: 'string', description: 'Database to run against (applied as USE before the query).' },
-        sql: { type: 'string', description: 'A single read-only statement. No semicolon-separated batches.' },
-        limit: { type: 'integer', description: `Max rows to return (default ${DEFAULT_ROW_LIMIT}, hard cap ${MAX_ROW_LIMIT}).` },
+        sql: { type: 'string', description: 'A single read-only statement. No semicolon-separated batches. Use ? placeholders for values and pass them in `params`.' },
+        params: { type: 'array', description: 'Values bound to ? placeholders in `sql`, in order. Safer and clearer than inlining literals.' },
+        limit: { type: 'integer', description: `Max rows returned (default ${DEFAULT_ROW_LIMIT}, hard cap ${MAX_ROW_LIMIT}). Must be an integer in range — out-of-range values are rejected, not clamped.` },
       },
       required: ['sql'],
     },
+  },
+  {
+    name: 'sample_rows', tier: 'read',
+    description: 'Return the first N rows of a table so you can see what the data actually looks like. The natural next step after describe_table, and cheaper than writing a SELECT.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ...CONN_ARG,
+        database: { type: 'string' }, table: { type: 'string' },
+        n: { type: 'integer', description: 'How many rows (default 10, max 100).' },
+      },
+      required: ['database', 'table'],
+    },
+  },
+  {
+    name: 'find_tables', tier: 'read',
+    description: 'Find tables whose name matches a SQL LIKE pattern (use % as the wildcard, e.g. "%user%"). Far cheaper than listing every table when you are hunting for where something lives. Searches all non-system databases unless you pass one.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ...CONN_ARG,
+        pattern: { type: 'string', description: 'SQL LIKE pattern, e.g. "%user%".' },
+        database: { type: 'string', description: 'Restrict to one database. Omit to search all non-system schemas.' },
+        limit: { type: 'integer', description: 'Max matches (default 100, max 500).' },
+      },
+      required: ['pattern'],
+    },
+  },
+  {
+    name: 'find_columns', tier: 'read',
+    description: 'Find columns whose name matches a SQL LIKE pattern, across tables. Use this to locate a field like "%email%" without dumping every schema.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ...CONN_ARG,
+        pattern: { type: 'string', description: 'SQL LIKE pattern, e.g. "%email%".' },
+        database: { type: 'string', description: 'Restrict to one database. Omit to search all non-system schemas.' },
+        limit: { type: 'integer', description: 'Max matches (default 100, max 500).' },
+      },
+      required: ['pattern'],
+    },
+  },
+  {
+    name: 'server_info', tier: 'read',
+    description: 'Server version and flavor (MySQL vs MariaDB), character set, collation, time zone, current server time and sql_mode. Check this before relying on syntax that differs between the two.',
+    inputSchema: { type: 'object', properties: { ...CONN_ARG } },
   },
   {
     name: 'update_cell', tier: 'write',
@@ -362,27 +472,75 @@ function createMcpServer(deps) {
         if (profile.database) return { databases: [profile.database], note: 'This connection is pinned to a single database.' };
         return { databases: unwrap(await db.listDatabases(poolId), 'list databases').databases };
       }
-      case 'list_tables':
-        return { database: needDb(), tables: unwrap(await db.listTables(poolId, needDb()), 'list tables').tables };
-      case 'describe_table':
-        return { columns: unwrap(await db.describeTable(poolId, needDb(), args.table), 'describe table').columns };
+      case 'list_tables': {
+        if (args.detail !== undefined && !['names', 'full'].includes(args.detail)) {
+          throw new RpcError(-32602, `detail must be "names" or "full", got ${JSON.stringify(args.detail)}`);
+        }
+        const r = unwrap(await db.listTablesRich(poolId, needDb()), 'list tables');
+        const full = args.detail === 'full';
+        const out = { database: needDb(), tables: full ? r.tables : r.tables.map(t => t.name) };
+        if (r.views.length) out.views = r.views;
+        if (!full) out.tableCount = r.tables.length;
+        return out;
+      }
+      case 'describe_table': {
+        const r = unwrap(await db.tableSchema(poolId, needDb(), args.table), 'describe table');
+        const out = { database: needDb(), table: args.table, columns: r.columns, meta: r.table };
+        if (r.indexes.length) out.indexes = r.indexes;
+        if (r.foreignKeys.length) out.foreignKeys = r.foreignKeys;
+        return out;
+      }
+      case 'sample_rows': {
+        const n = intArg(args.n, 'n', 1, 100, 10);
+        const r = unwrap(await db.sampleRows(poolId, needDb(), args.table, n), 'sample rows');
+        return { columns: r.columns, rows: r.rows, rowCount: r.rows.length };
+      }
+      case 'find_tables': {
+        const limit = intArg(args.limit, 'limit', 1, 500, 100);
+        const scope = profile.database || args.database || undefined;
+        const r = unwrap(await db.findTables(poolId, args.pattern, scope, limit), 'find tables');
+        return { pattern: args.pattern, matchCount: r.matches.length, matches: r.matches };
+      }
+      case 'find_columns': {
+        const limit = intArg(args.limit, 'limit', 1, 500, 100);
+        const scope = profile.database || args.database || undefined;
+        const r = unwrap(await db.findColumns(poolId, args.pattern, scope, limit), 'find columns');
+        return { pattern: args.pattern, matchCount: r.matches.length, matches: r.matches };
+      }
+      case 'server_info':
+        return unwrap(await db.serverDetail(poolId), 'server info').info;
       case 'count_rows':
         return { count: unwrap(await db.tableCount(poolId, needDb(), args.table), 'count rows').count };
       case 'run_select': {
         if (!isReadOnlySQL(args.sql)) {
           throw new RpcError(-32602, 'Rejected: run_select accepts a single read-only statement (SELECT/SHOW/DESCRIBE/EXPLAIN/WITH). Use update_cell, insert_row or delete_row to change data.');
         }
-        const limit = Math.min(Math.max(parseInt(args.limit) || DEFAULT_ROW_LIMIT, 1), MAX_ROW_LIMIT);
-        const res = unwrap(await db.query(poolId, dbName, args.sql), 'query');
+        const limit = intArg(args.limit, 'limit', 1, MAX_ROW_LIMIT, DEFAULT_ROW_LIMIT);
+        if (args.params !== undefined && !Array.isArray(args.params)) {
+          throw new RpcError(-32602, 'params must be an array of values bound to ? placeholders, in order.');
+        }
+        const res = unwrap(await db.query(poolId, dbName, args.sql, {
+          params: args.params, timeoutSec: deps.readTimeoutSec,
+        }), 'query');
         if (res.type !== 'select') return { affectedRows: res.affectedRows };
         const rows = res.rows.slice(0, limit);
-        return {
+        const out = {
           columns: res.cols.map(c => c.name),
           rows,
           rowCount: rows.length,
-          truncated: res.rows.length > limit,
+          totalRows: res.rows.length,       // so `truncated` is actionable
           elapsedMs: res.elapsed,
         };
+        if (res.rows.length > limit) out.truncated = true;
+        // Only worth the bytes when a column is not a plain string/number:
+        // mysql2 returns DECIMAL/BIGINT as strings to preserve precision.
+        const typed = res.cols.filter(c => /DECIMAL|NEWDECIMAL|LONGLONG|BIT/i.test(c.typeName || ''));
+        if (typed.length) {
+          out.columnTypes = {};
+          for (const c of res.cols) out.columnTypes[c.name] = c.typeName;
+          out.note = 'DECIMAL/BIGINT columns are returned as strings to avoid precision loss above 2^53. Parse them before doing arithmetic.';
+        }
+        return out;
       }
       case 'update_cell': {
         const r = unwrap(await db.updateCell(poolId, needDb(), args.table, args.column, args.value === undefined ? null : args.value, args.where), 'update');
@@ -415,7 +573,7 @@ function createMcpServer(deps) {
         unwrap(await db.dropColumn(poolId, needDb(), args.table, args.name), 'drop column');
         return { ok: true };
       case 'execute_sql': {
-        const res = unwrap(await db.query(poolId, dbName, args.sql), 'execute');
+        const res = unwrap(await db.query(poolId, dbName, args.sql, { timeoutSec: deps.writeTimeoutSec }), 'execute');
         if (res.type !== 'select') {
           return { affectedRows: res.affectedRows, insertId: res.insertId, info: res.info, elapsedMs: res.elapsed };
         }
@@ -443,6 +601,10 @@ function createMcpServer(deps) {
       case 'describe_table':   return `Describe ${t}`;
       case 'count_rows':       return `Count rows in ${t}`;
       case 'run_select':       return `Run: ${String(args.sql || '').replace(/\s+/g, ' ').slice(0, 120)}`;
+      case 'sample_rows':      return `Sample ${args.n || 10} rows from ${t}`;
+      case 'find_tables':      return `Find tables matching ${args.pattern}`;
+      case 'find_columns':     return `Find columns matching ${args.pattern}`;
+      case 'server_info':      return 'Read server version/charset/timezone';
       case 'update_cell':      return `Set ${t}.${args.column} = ${JSON.stringify(args.value)} where ${JSON.stringify(args.where)}`;
       case 'insert_row':       return `Insert into ${t}: ${JSON.stringify(args.values || {})}`;
       case 'delete_row':       return `DELETE from ${t} where ${JSON.stringify(args.where)}`;
@@ -476,6 +638,7 @@ function createMcpServer(deps) {
     }
 
     const profile = resolveProfile(args.connection);
+    requireArgs(tool, args, profile);
     const summary = summarize(name, args, profile);
 
     // ── approval gate ──
@@ -566,7 +729,7 @@ function createMcpServer(deps) {
       }
       case 'tools/call': {
         const out = await callTool(params);
-        return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(out) }] };
       }
       // We don't advertise these capabilities, but some clients probe anyway.
       case 'resources/list':           return { resources: [] };
