@@ -330,3 +330,13 @@ td.editing { padding: 2px 4px; }
 .conn-mgr-actions .icon-btn { height: 24px; }
 .mcp-pill.connected { background: rgba(34,197,94,0.13); color: #4ade80; border-color: rgba(34,197,94,0.35); }
 .mcp-pill.active { background: var(--accent-glow); color: var(--accent); border-color: rgba(59,130,246,0.4); }
+
+/* per-connection table scope editor (inside the MCP connections list) */
+.mcp-prof-row { display: flex; flex-direction: column; gap: 3px; padding: 2px 0; }
+.mcp-prof-row .mcp-check { gap: 7px; }
+.mcp-scope-btn { margin-left: auto; flex-shrink: 0; font-size: 10.5px; }
+.mcp-scope { display: flex; flex-direction: column; gap: 5px; margin: 3px 0 7px 22px; padding: 8px 9px; background: var(--bg1); border: 1px solid var(--border); border-radius: 5px; }
+.mcp-scope .mcp-btn-row { gap: 12px; }
+.mcp-scope-list { background: var(--bg0); border: 1px solid var(--border); border-radius: 4px; color: var(--text1); font-family: var(--mono); font-size: 11px; padding: 6px 8px; min-height: 62px; resize: vertical; outline: none; width: 100%; line-height: 1.5; }
+.mcp-scope-list:focus { border-color: var(--accent); }
+.mcp-scope-list::placeholder { color: var(--text3); }

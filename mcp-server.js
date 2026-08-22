@@ -103,6 +103,81 @@ function intArg(value, name, min, max, fallback) {
   return n;
 }
 
+// ─── PER-CONNECTION TABLE RULES ──────────────────────────────
+// Each shared connection can restrict which tables MCP may touch:
+//   mode 'all'        no restriction
+//   mode 'denylist'   every table EXCEPT those matching a pattern
+//   mode 'allowlist'  ONLY tables matching a pattern
+//
+// A pattern is `table` (any database) or `database.table`, and `*` is a
+// wildcard: `nexus_*_tokens`, `hypercore_nexus.nexus_app_secrets`.
+// Matching is case-insensitive, because MySQL's own case sensitivity varies by
+// platform and over-blocking is the safe direction to err.
+//
+// An empty allowlist blocks everything. That is deliberate — a half-configured
+// allowlist must fail closed, not open.
+function globToRegExp(glob) {
+  let out = '';
+  for (const ch of String(glob)) {
+    out += ch === '*' ? '.*' : ch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+  return new RegExp('^' + out + '$', 'i');
+}
+
+function parseTablePattern(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return null;
+  const dot = s.indexOf('.');
+  if (dot > 0) return { db: globToRegExp(s.slice(0, dot)), table: globToRegExp(s.slice(dot + 1)) };
+  return { db: null, table: globToRegExp(s) };
+}
+
+function tableRulesFor(cfg, profile) {
+  const r = (cfg.tableRules || {})[profile.id];
+  if (!r || !r.mode || r.mode === 'all') return null;
+  return { mode: r.mode, patterns: (r.patterns || []).map(parseTablePattern).filter(Boolean) };
+}
+
+function tableAllowed(rules, database, table) {
+  if (!rules) return true;
+  const hit = rules.patterns.some(p => (!p.db || p.db.test(database || '')) && p.table.test(table));
+  return rules.mode === 'allowlist' ? hit : !hit;
+}
+
+// Phrased so it neither confirms nor denies that the table exists — the user
+// chose to hide restricted tables, and listings already omit them.
+function assertTableAllowed(rules, database, table) {
+  if (!tableAllowed(rules, database, table)) {
+    throw new RpcError(-32602,
+      `Table "${database}.${table}" is not available on this connection. Do not try to reach it by another route; tell the user it is outside the access they granted.`);
+  }
+}
+
+// Raw SQL can name a table in any syntactic position, and we have no SQL
+// parser. Rather than guess at structure, we resolve the concrete set of
+// off-limits table names for the database and reject the statement if any of
+// them appears as an identifier anywhere in it. This over-blocks when a column
+// or alias happens to share a forbidden table's name — an acceptable trade,
+// since the alternative is under-blocking.
+function sqlNamesForbiddenTable(sql, forbidden, stripLiterals) {
+  let s = String(sql)
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/--[^\n]*/g, ' ')
+    .replace(/#[^\n]*/g, ' ');
+  // For validated read-only SQL a string literal cannot become a table
+  // reference (PREPARE/EXECUTE are already rejected), so literals are blanked
+  // to avoid false positives. For raw execute_sql they are NOT blanked, because
+  // dynamic SQL there could turn a literal into an identifier.
+  if (stripLiterals) {
+    s = s.replace(/'(?:[^'\\]|\\.|'')*'/g, "''").replace(/"(?:[^"\\]|\\.|"")*"/g, '""');
+  }
+  for (const name of forbidden) {
+    const re = new RegExp('(^|[^A-Za-z0-9_$])' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '($|[^A-Za-z0-9_$])', 'i');
+    if (re.test(s)) return name;
+  }
+  return null;
+}
+
 // ─── TOOL REGISTRY ───────────────────────────────────────────
 // `tier` drives the permission model:
 //   read   → always available
@@ -413,6 +488,40 @@ function createMcpServer(deps) {
 
   const cfg = () => deps.getConfig();
 
+  // Resolving the forbidden set needs the database's real table list. Cache it
+  // briefly so a burst of tool calls does not re-query information_schema each
+  // time; the TTL is short enough that a new table shows up promptly.
+  const tableCache = new Map();
+  const TABLE_CACHE_MS = 15000;
+  async function tablesIn(poolId, database) {
+    const key = poolId + '|' + database;
+    const hit = tableCache.get(key);
+    if (hit && Date.now() - hit.at < TABLE_CACHE_MS) return hit.names;
+    const r = await deps.db.listTablesRich(poolId, database);
+    const names = r && r.ok ? r.tables.map(t => t.name).concat(r.views) : [];
+    tableCache.set(key, { at: Date.now(), names });
+    return names;
+  }
+
+  // Concrete names this connection may not touch in `database`.
+  async function forbiddenTables(rules, poolId, database) {
+    if (!rules || !database) return [];
+    return (await tablesIn(poolId, database)).filter(t => !tableAllowed(rules, database, t));
+  }
+
+  // Gate raw SQL. `stripLiterals` is true only for validated read-only SQL.
+  async function guardSql(rules, poolId, database, sql, stripLiterals) {
+    if (!rules) return;
+    const forbidden = await forbiddenTables(rules, poolId, database);
+    if (!forbidden.length) return;
+    const hit = sqlNamesForbiddenTable(sql, forbidden, stripLiterals);
+    if (hit) {
+      throw new RpcError(-32602,
+        'This statement refers to a table that is not available on this connection. ' +
+        'Rewrite it without that table, or tell the user it is outside the access they granted.');
+    }
+  }
+
   // Profiles this server is permitted to touch.
   function visibleProfiles() {
     const c = cfg();
@@ -462,6 +571,9 @@ function createMcpServer(deps) {
   async function execTool(name, args, poolId, profile) {
     const db = deps.db;
     const dbName = resolveDatabase(profile, args.database);
+    const rules = tableRulesFor(cfg(), profile);
+    // Any tool that names a table directly is checked up front.
+    if (rules && args.table) assertTableAllowed(rules, dbName, args.table);
     const needDb = () => {
       if (!dbName) throw new RpcError(-32602, 'A "database" argument is required for this connection.');
       return dbName;
@@ -477,10 +589,13 @@ function createMcpServer(deps) {
           throw new RpcError(-32602, `detail must be "names" or "full", got ${JSON.stringify(args.detail)}`);
         }
         const r = unwrap(await db.listTablesRich(poolId, needDb()), 'list tables');
+        const keep = t => tableAllowed(rules, needDb(), typeof t === 'string' ? t : t.name);
+        const tables = r.tables.filter(keep);
+        const views = r.views.filter(keep);
         const full = args.detail === 'full';
-        const out = { database: needDb(), tables: full ? r.tables : r.tables.map(t => t.name) };
-        if (r.views.length) out.views = r.views;
-        if (!full) out.tableCount = r.tables.length;
+        const out = { database: needDb(), tables: full ? tables : tables.map(t => t.name) };
+        if (views.length) out.views = views;
+        if (!full) out.tableCount = tables.length;
         return out;
       }
       case 'describe_table': {
@@ -499,13 +614,15 @@ function createMcpServer(deps) {
         const limit = intArg(args.limit, 'limit', 1, 500, 100);
         const scope = profile.database || args.database || undefined;
         const r = unwrap(await db.findTables(poolId, args.pattern, scope, limit), 'find tables');
-        return { pattern: args.pattern, matchCount: r.matches.length, matches: r.matches };
+        const matches = r.matches.filter(m => tableAllowed(rules, m.database, m.table));
+        return { pattern: args.pattern, matchCount: matches.length, matches };
       }
       case 'find_columns': {
         const limit = intArg(args.limit, 'limit', 1, 500, 100);
         const scope = profile.database || args.database || undefined;
         const r = unwrap(await db.findColumns(poolId, args.pattern, scope, limit), 'find columns');
-        return { pattern: args.pattern, matchCount: r.matches.length, matches: r.matches };
+        const matches = r.matches.filter(m => tableAllowed(rules, m.database, m.table));
+        return { pattern: args.pattern, matchCount: matches.length, matches };
       }
       case 'server_info':
         return unwrap(await db.serverDetail(poolId), 'server info').info;
@@ -519,6 +636,7 @@ function createMcpServer(deps) {
         if (args.params !== undefined && !Array.isArray(args.params)) {
           throw new RpcError(-32602, 'params must be an array of values bound to ? placeholders, in order.');
         }
+        await guardSql(rules, poolId, dbName, args.sql, true);
         const res = unwrap(await db.query(poolId, dbName, args.sql, {
           params: args.params, timeoutSec: deps.readTimeoutSec,
         }), 'query');
@@ -573,6 +691,7 @@ function createMcpServer(deps) {
         unwrap(await db.dropColumn(poolId, needDb(), args.table, args.name), 'drop column');
         return { ok: true };
       case 'execute_sql': {
+        await guardSql(rules, poolId, dbName, args.sql, false);
         const res = unwrap(await db.query(poolId, dbName, args.sql, { timeoutSec: deps.writeTimeoutSec }), 'execute');
         if (res.type !== 'select') {
           return { affectedRows: res.affectedRows, insertId: res.insertId, info: res.info, elapsedMs: res.elapsed };
@@ -683,6 +802,9 @@ function createMcpServer(deps) {
       '',
       `Connections shared with you: ${conns.length ? conns.map(p => p.name + (p.database ? ` (pinned to ${p.database})` : '')).join(', ') : 'none yet'}.`,
       `Permission level: ${effectiveLevel(c)}. Enabled tools: ${names.join(', ') || 'none'}.`,
+      ...(conns.some(p => tableRulesFor(c, p))
+        ? ['Some connections expose only part of their schema. Tables outside that scope are omitted from listings and cannot be read by any route, including raw SQL. If a query is refused for that reason, say so plainly rather than probing for another way in.']
+        : []),
       '',
       'Rules:',
       '1. Call list_connections first, then describe_table before touching any table — you need its primary key.',
@@ -874,7 +996,7 @@ function createMcpServer(deps) {
     };
   }
 
-  function clearSessionGrants() { sessionGrants.clear(); }
+  function clearSessionGrants() { sessionGrants.clear(); tableCache.clear(); }
 
   return { start, stop, status, clearSessionGrants };
 }

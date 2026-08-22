@@ -843,6 +843,9 @@ const MCP_DEFAULTS = {
   customTools: [],
   approval: 'writes',             // 'always' | 'writes' | 'never'
   dangerousEnabled: false,
+  // Per-connection table scoping, keyed by profile id:
+  //   { "p_x": { mode: 'all'|'denylist'|'allowlist', patterns: ['secrets','db.tbl_*'] } }
+  tableRules: {},
 };
 
 let mcpConfig = { ...MCP_DEFAULTS };
@@ -1006,6 +1009,11 @@ ipcMain.handle('mcp-save', async (_, cfg) => {
     // Turning the danger toggle off must immediately revoke Complete Access.
     if (!next.dangerousEnabled && mcpConfig.permissionLevel === 'complete') next.permissionLevel = 'full';
     next.port = Math.min(Math.max(parseInt(next.port) || MCP_DEFAULTS.port, 1024), 65535);
+    // Prune table rules whose profile has been deleted.
+    if (next.tableRules) {
+      const live = new Set(loadProfilesFromDisk().map(p => p.id));
+      for (const id of Object.keys(next.tableRules)) if (!live.has(id)) delete next.tableRules[id];
+    }
     if (!next.token) next.token = newToken();
     mcpConfig = next;
     saveMcpConfig(mcpConfig);

@@ -132,19 +132,107 @@ async function toggleMcpServer() {
 function renderMcpProfiles() {
   const box = document.getElementById('mcpProfileList');
   const allowed = new Set((mcpState.cfg && mcpState.cfg.allowedProfiles) || []);
+  const rules = (mcpState.cfg && mcpState.cfg.tableRules) || {};
   const list = Object.values(state.profiles || {});
   if (!list.length) {
     box.innerHTML = '<div class="mcp-list-empty">No saved connections yet — add one with “+ Connection” first.</div>';
     return;
   }
-  box.innerHTML = list.map(p =>
-    '<label class="mcp-check">' +
-      '<input type="checkbox" class="mcp-prof" value="' + esc(p.id) + '"' + (allowed.has(p.id) ? ' checked' : '') + '>' +
-      '<span>' + esc(p.name || p.host) + '</span>' +
-      '<span class="mcp-note">' + esc(p.user || '') + '@' + esc(p.host || '') + ':' + esc(String(p.port || 3306)) +
-        (p.database ? ' · ' + esc(p.database) : '') + '</span>' +
-    '</label>'
-  ).join('');
+  box.innerHTML = list.map(p => {
+    const r = rules[p.id] || { mode: 'all', patterns: [] };
+    const mode = r.mode || 'all';
+    const pats = (r.patterns || []).join('\n');
+    const id = esc(p.id);
+    return '' +
+      '<div class="mcp-prof-row">' +
+        '<label class="mcp-check">' +
+          '<input type="checkbox" class="mcp-prof" value="' + id + '"' + (allowed.has(p.id) ? ' checked' : '') + '>' +
+          '<span>' + esc(p.name || p.host) + '</span>' +
+          '<span class="mcp-note">' + esc(p.user || '') + '@' + esc(p.host || '') + ':' + esc(String(p.port || 3306)) +
+            (p.database ? ' · ' + esc(p.database) : '') + '</span>' +
+          '<button class="tb-btn mini mcp-scope-btn" data-prof="' + id + '" ' +
+            'onclick="toggleTableScope(event, &quot;' + id + '&quot;)">' + tableScopeLabel(r) + '</button>' +
+        '</label>' +
+        '<div class="mcp-scope" id="scope_' + id + '" style="display:none;">' +
+          '<div class="mcp-btn-row">' +
+            '<label class="mcp-check"><input type="radio" name="scope_' + id + '" class="mcp-scope-mode" data-prof="' + id + '" value="all"' + (mode === 'all' ? ' checked' : '') + ' onchange="onTableScopeChange(&quot;' + id + '&quot;)"> All tables</label>' +
+            '<label class="mcp-check"><input type="radio" name="scope_' + id + '" class="mcp-scope-mode" data-prof="' + id + '" value="denylist"' + (mode === 'denylist' ? ' checked' : '') + ' onchange="onTableScopeChange(&quot;' + id + '&quot;)"> Block listed</label>' +
+            '<label class="mcp-check"><input type="radio" name="scope_' + id + '" class="mcp-scope-mode" data-prof="' + id + '" value="allowlist"' + (mode === 'allowlist' ? ' checked' : '') + ' onchange="onTableScopeChange(&quot;' + id + '&quot;)"> Only listed</label>' +
+          '</div>' +
+          '<textarea class="mcp-scope-list" id="scopelist_' + id + '" data-prof="' + id + '" spellcheck="false" ' +
+            'oninput="onTableScopeChange(&quot;' + id + '&quot;)" ' +
+            'placeholder="One pattern per line, e.g.&#10;nexus_app_secrets&#10;nexus_*_tokens&#10;hypercore_nexus.nexus_paypal_config">' + esc(pats) + '</textarea>' +
+          '<div class="mcp-hint" id="scopehint_' + id + '"></div>' +
+        '</div>' +
+      '</div>';
+  }).join('');
+  list.forEach(p => updateTableScopeHint(p.id));
+}
+
+// ─── TABLE SCOPE (per connection) ────────────────────────────
+// Restricts which tables MCP may reach on one connection. Blocked tables are
+// filtered out of every listing and refused on every route, raw SQL included.
+function tableScopeLabel(r) {
+  const mode = (r && r.mode) || 'all';
+  const n = ((r && r.patterns) || []).length;
+  if (mode === 'denylist') return '⛔ ' + n + ' blocked';
+  if (mode === 'allowlist') return '✓ only ' + n;
+  return '▤ all tables';
+}
+
+function toggleTableScope(ev, profileId) {
+  ev.preventDefault();
+  ev.stopPropagation();          // the button lives inside a <label>
+  const box = document.getElementById('scope_' + profileId);
+  box.style.display = box.style.display === 'none' ? '' : 'none';
+}
+
+function readTableScope(profileId) {
+  const picked = document.querySelector('input.mcp-scope-mode[data-prof="' + profileId + '"]:checked');
+  const ta = document.getElementById('scopelist_' + profileId);
+  const patterns = ((ta && ta.value) || '').split('\n').map(x => x.trim()).filter(Boolean);
+  return { mode: (picked && picked.value) || 'all', patterns };
+}
+
+function onTableScopeChange(profileId) {
+  updateTableScopeHint(profileId);
+  const btn = document.querySelector('.mcp-scope-btn[data-prof="' + profileId + '"]');
+  if (btn) btn.textContent = tableScopeLabel(readTableScope(profileId));
+}
+
+// Spell out what the setting actually does. The empty allowlist blocking
+// everything is the case that surprises people, so it is called out in red.
+function updateTableScopeHint(profileId) {
+  const el = document.getElementById('scopehint_' + profileId);
+  if (!el) return;
+  const { mode, patterns } = readTableScope(profileId);
+  let msg, danger = false;
+  if (mode === 'all') {
+    msg = 'MCP can reach every table on this connection.';
+  } else if (mode === 'denylist') {
+    msg = patterns.length
+      ? 'Everything except the ' + patterns.length + ' pattern(s) above. Blocked tables are hidden from listings and unreachable by any route, including raw SQL.'
+      : 'No patterns listed, so nothing is blocked yet.';
+  } else {
+    msg = patterns.length
+      ? 'Only tables matching the ' + patterns.length + ' pattern(s) above. Everything else is hidden and unreachable.'
+      : 'No patterns listed — this blocks EVERY table on this connection.';
+    danger = patterns.length === 0;
+  }
+  el.textContent = msg;
+  el.classList.toggle('mcp-danger-text', danger);
+}
+
+// Only connections with a real restriction are persisted, so "no rules" stays
+// unambiguous and the config file does not fill with empty entries.
+function collectTableRules() {
+  const out = {};
+  document.querySelectorAll('.mcp-scope-list').forEach(ta => {
+    const id = ta.dataset.prof;
+    const { mode, patterns } = readTableScope(id);
+    if (mode !== 'all') out[id] = { mode, patterns };
+  });
+  return out;
 }
 
 function renderMcpTools() {
@@ -208,6 +296,7 @@ async function saveMcpSettings(silent) {
     customMode: getRadio('mcpCustomMode', 'whitelist'),
     customTools: [...document.querySelectorAll('.mcp-tool:checked')].map(el => el.value),
     approval: getRadio('mcpApproval', 'writes'),
+    tableRules: collectTableRules(),
   };
 
   const res = await window.api.mcpSave(cfg);
@@ -291,8 +380,11 @@ async function mcpForgetProfile(profileId) {
     const cur = await window.api.mcpGet();
     if (!cur || !cur.ok) return;
     const allowed = cur.config.allowedProfiles || [];
-    if (!allowed.includes(profileId)) return;
-    const next = { ...cur.config, allowedProfiles: allowed.filter(id => id !== profileId) };
+    const rules = { ...(cur.config.tableRules || {}) };
+    const hadRules = Object.prototype.hasOwnProperty.call(rules, profileId);
+    if (!allowed.includes(profileId) && !hadRules) return;
+    delete rules[profileId];
+    const next = { ...cur.config, allowedProfiles: allowed.filter(id => id !== profileId), tableRules: rules };
     delete next.token;                       // main keeps the token; never round-trip it
     const res = await window.api.mcpSave(next);
     if (res && res.ok) { mcpState.cfg = res.config; mcpState.status = res; }

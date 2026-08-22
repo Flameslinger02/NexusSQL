@@ -1,6 +1,6 @@
 {
   "name": "nexussql",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "NexusSQL - Real MySQL/MariaDB client with AI assistant",
   "main": "main.js",
   "author": "Command Nexus",
